@@ -25,7 +25,8 @@ class DrinkerPreset {
 
   int get volumeMl => targetMl ?? (calculatedLiters * 1000).round();
 
-  double get calculatedLiters => (fillSec / 60.0) * pumpLpm;
+  double get calculatedLiters =>
+      targetMl != null ? (targetMl! / 1000.0) : (fillSec / 60.0) * pumpLpm;
 
   String get volumeChipLabel {
     final ml = volumeMl;
@@ -63,6 +64,17 @@ class DrinkerPreset {
       );
 
   static List<DrinkerPreset> defaultPresets() => [
+        DrinkerPreset(
+          id: 'preset_1l',
+          name: '1 Liter Refill (1.0L)',
+          drainSec: 20,
+          fillSec: 20,
+          pauseSec: 2,
+          drainSpeed: 80,
+          fillSpeed: 80,
+          pumpLpm: 3.0,
+          targetMl: 1000,
+        ),
         DrinkerPreset(
           id: 'preset_std',
           name: 'Standard Refill (1.5L)',
@@ -109,4 +121,112 @@ class DrinkerPreset {
       return defaultPresets();
     }
   }
+
+  /// Computes the required drain seconds to completely evacuate a given volume in mL,
+  /// based on pump flow rate (LPM), motor speed %, and safety buffer seconds.
+  static int computeSmartDrainSec({
+    required int volumeMl,
+    required double pumpLpm,
+    required int drainSpeedPercent,
+    int safetyBufferSec = 2,
+  }) {
+    final effectiveMlPerSec =
+        (pumpLpm * (drainSpeedPercent / 100.0) * 1000.0) / 60.0;
+    if (effectiveMlPerSec <= 0) return 30;
+    final drainSec = (volumeMl / effectiveMlPerSec).ceil() + safetyBufferSec;
+    return drainSec.clamp(5, 300);
+  }
+}
+
+class LastRefillRecord {
+  final DateTime timestamp;
+  final int volumeMl;
+  final double liters;
+  final String presetName;
+  final String presetChipLabel;
+  final int drainSec;
+  final int fillSec;
+
+  LastRefillRecord({
+    required this.timestamp,
+    required this.volumeMl,
+    required this.liters,
+    required this.presetName,
+    required this.presetChipLabel,
+    required this.drainSec,
+    required this.fillSec,
+  });
+
+  /// Computes the drain seconds needed to evacuate this recorded refill volume.
+  int computeSmartDrainSec({
+    required double pumpLpm,
+    required int drainSpeedPercent,
+    int safetyBufferSec = 2,
+  }) {
+    return DrinkerPreset.computeSmartDrainSec(
+      volumeMl: volumeMl,
+      pumpLpm: pumpLpm,
+      drainSpeedPercent: drainSpeedPercent,
+      safetyBufferSec: safetyBufferSec,
+    );
+  }
+
+  String get timeAgo {
+    final now = DateTime.now();
+    final diff = now.difference(timestamp);
+    if (diff.inSeconds < 45) return 'Just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) {
+      final h = timestamp.hour % 12 == 0 ? 12 : timestamp.hour % 12;
+      final m = timestamp.minute.toString().padLeft(2, '0');
+      final ampm = timestamp.hour >= 12 ? 'PM' : 'AM';
+      return '${diff.inHours}h ago ($h:$m $ampm)';
+    }
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec'
+    ];
+    final h = timestamp.hour % 12 == 0 ? 12 : timestamp.hour % 12;
+    final m = timestamp.minute.toString().padLeft(2, '0');
+    final ampm = timestamp.hour >= 12 ? 'PM' : 'AM';
+    return '${months[timestamp.month - 1]} ${timestamp.day}, $h:$m $ampm';
+  }
+
+  String get shortTimeStr {
+    final h = timestamp.hour % 12 == 0 ? 12 : timestamp.hour % 12;
+    final m = timestamp.minute.toString().padLeft(2, '0');
+    final ampm = timestamp.hour >= 12 ? 'PM' : 'AM';
+    return '$h:$m $ampm';
+  }
+
+  Map<String, dynamic> toJson() => {
+        'timestamp': timestamp.toIso8601String(),
+        'volumeMl': volumeMl,
+        'liters': liters,
+        'presetName': presetName,
+        'presetChipLabel': presetChipLabel,
+        'drainSec': drainSec,
+        'fillSec': fillSec,
+      };
+
+  factory LastRefillRecord.fromJson(Map<String, dynamic> json) =>
+      LastRefillRecord(
+        timestamp: DateTime.tryParse(json['timestamp'] ?? '') ?? DateTime.now(),
+        volumeMl: (json['volumeMl'] as num?)?.toInt() ?? 1000,
+        liters: (json['liters'] as num?)?.toDouble() ?? 1.0,
+        presetName: json['presetName'] ?? 'Standard Drinker',
+        presetChipLabel: json['presetChipLabel'] ?? '1.0L',
+        drainSec: (json['drainSec'] as num?)?.toInt() ?? 30,
+        fillSec: (json['fillSec'] as num?)?.toInt() ?? 40,
+      );
 }

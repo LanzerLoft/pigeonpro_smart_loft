@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'screens/main_navigation_screen.dart';
 
 void main() {
@@ -8,7 +7,7 @@ void main() {
 }
 
 class PigeonProApp extends StatelessWidget {
-  const PigeonProApp({Key? key}) : super(key: key);
+  const PigeonProApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -23,8 +22,22 @@ class PigeonProApp extends StatelessWidget {
           secondary: Color(0xFF10B981),
           surface: Color(0xFF1E293B),
         ),
-        textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme),
+        snackBarTheme: SnackBarThemeData(
+          backgroundColor: const Color(0xFF1E293B),
+          contentTextStyle: const TextStyle(
+            color: Colors.white,
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+          actionTextColor: const Color(0xFF38BDF8),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: const BorderSide(color: Color(0xFF334155), width: 1.0),
+          ),
+        ),
         useMaterial3: true,
+        fontFamilyFallback: const ['Roboto', 'sans-serif', 'Segoe UI'],
       ),
       home: const MainNavigationScreen(),
     );

@@ -127,15 +127,42 @@ class Esp8266Service {
   }
 
   // Submit Wi-Fi credentials to ESP8266 (POST /api/wifi/save)
-  Future<bool> saveWifi(String baseUrl, String ssid, String pass) async {
+  Future<WifiSaveResult> saveWifi(String baseUrl, String ssid, String pass) async {
     try {
       final response = await http.post(
         Uri.parse('$baseUrl/api/wifi/save'),
         body: {'ssid': ssid, 'pass': pass},
-      ).timeout(const Duration(seconds: 5));
-      return response.statusCode == 200;
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode == 200) {
+        try {
+          final data = jsonDecode(response.body);
+          return WifiSaveResult.success(
+            ip: data['ip'] as String?,
+            ssid: data['ssid'] as String?,
+          );
+        } catch (_) {
+          return WifiSaveResult.success();
+        }
+      } else {
+        try {
+          final data = jsonDecode(response.body);
+          final msg = data['error'] ?? data['message'] ?? 'Connection failed';
+          return WifiSaveResult.failure(msg);
+        } catch (_) {
+          return WifiSaveResult.failure('Failed with HTTP ${response.statusCode}');
+        }
+      }
     } catch (e) {
-      return false;
+      final err = e.toString();
+      if (err.contains('SocketException') ||
+          err.contains('ClientException') ||
+          err.contains('Connection reset') ||
+          err.contains('Connection closed')) {
+        // ESP8266 rebooted after processing credentials
+        return WifiSaveResult.success(ssid: ssid);
+      }
+      return WifiSaveResult.failure(e.toString());
     }
   }
 

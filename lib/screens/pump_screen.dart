@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/relay_status.dart';
@@ -7,6 +10,7 @@ import '../services/log_service.dart';
 import '../widgets/pump_card_widget.dart';
 import '../widgets/drinker_schedule_widget.dart';
 import '../widgets/log_session_widget.dart';
+import '../widgets/cylinder_water_tank_widget.dart';
 import 'pump_detail_screen.dart';
 
 class PumpScreen extends StatefulWidget {
@@ -15,17 +19,18 @@ class PumpScreen extends StatefulWidget {
   final VoidCallback onRefresh;
 
   const PumpScreen({
-    Key? key,
+    super.key,
     required this.status,
     required this.deviceUrl,
     required this.onRefresh,
-  }) : super(key: key);
+  });
 
   @override
   State<PumpScreen> createState() => _PumpScreenState();
 }
 
-class _PumpScreenState extends State<PumpScreen> {
+class _PumpScreenState extends State<PumpScreen>
+    with TickerProviderStateMixin {
   final Esp8266Service _apiService = Esp8266Service();
   final GlobalKey<DrinkerScheduleWidgetState> _drinkerSchedKey =
       GlobalKey<DrinkerScheduleWidgetState>();
@@ -44,6 +49,26 @@ class _PumpScreenState extends State<PumpScreen> {
   int _pauseSec = 2;
   double _pumpLpm = 3.0; // Pump Flow Rate rating in Liters per minute
 
+  bool _wasCycleActive = false;
+  bool _isCycleCompleted = false;
+  LastRefillRecord? _lastRefill;
+  int _cycleStartMl = 0;
+
+  // Real-time water volume level in the drinker bowl (decreases on drain, increases on refill)
+  int _currentWaterLevelMl = 1500;
+  Timer? _manualDrainTrackingTimer;
+  Timer? _manualRefillTrackingTimer;
+  int _manualDrainElapsedSec = 0;
+  int _manualRefillElapsedSec = 0;
+  bool _isPump1ManuallyActive = false;
+  bool _isPump2ManuallyActive = false;
+
+  // Set Bowl to Empty drain animation
+  AnimationController? _drainToEmptyAnimController;
+  Animation<double>? _drainToEmptyProgressAnim;
+  Animation<int>? _drainToEmptyMlAnim;
+  bool _isDrainingToEmpty = false;
+
   DrinkerPreset get _activePreset {
     return _presets.firstWhere(
       (p) => p.id == _activePresetId,
@@ -59,11 +84,480 @@ class _PumpScreenState extends State<PumpScreen> {
     _drainSecController = TextEditingController(text: '30');
     _fillSecController = TextEditingController(text: '40');
     _lpmController = TextEditingController(text: '3.0');
+    _wasCycleActive = widget.status?.autoCycle?.active ?? false;
     _loadCustomPumpNamesAndSettings();
   }
 
   @override
+  void didUpdateWidget(PumpScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final wasActive = oldWidget.status?.autoCycle?.active ?? false;
+    final isNowActive = widget.status?.autoCycle?.active ?? false;
+
+    if (isNowActive) {
+      _wasCycleActive = true;
+      _isCycleCompleted = false;
+    } else if (wasActive && !isNowActive && _wasCycleActive) {
+      final completedPreset = _activePreset;
+      final record = LastRefillRecord(
+        timestamp: DateTime.now(),
+        volumeMl: completedPreset.volumeMl,
+        liters: completedPreset.calculatedLiters,
+        presetName: completedPreset.name,
+        presetChipLabel: completedPreset.volumeChipLabel,
+        drainSec: completedPreset.drainSec,
+        fillSec: completedPreset.fillSec,
+      );
+      _saveLastRefill(record);
+      setState(() {
+        _lastRefill = record;
+        _currentWaterLevelMl = completedPreset.volumeMl;
+        _isCycleCompleted = true;
+        _wasCycleActive = false;
+      });
+      _saveCurrentWaterLevel();
+    }
+
+    // Monitor manual pump activity outside of auto-cycle
+    final isAutoCycle = widget.status?.autoCycle?.active ?? false;
+    final isPump1On = (widget.status?.pump?.active ?? false) &&
+        !isAutoCycle &&
+        !_isDrainingToEmpty;
+    final isPump2On = (widget.status?.pump2?.active ?? false) && !isAutoCycle;
+
+    if (isPump1On) {
+      if (_manualDrainTrackingTimer == null || !_manualDrainTrackingTimer!.isActive) {
+        _startManualDrainTracking();
+      }
+    } else {
+      if (_manualDrainTrackingTimer != null) {
+        _stopManualDrainTracking();
+      }
+    }
+
+    if (isPump2On) {
+      if (_manualRefillTrackingTimer == null || !_manualRefillTrackingTimer!.isActive) {
+        _startManualRefillTracking();
+      }
+    } else {
+      if (_manualRefillTrackingTimer != null) {
+        _stopManualRefillTracking();
+      }
+    }
+  }
+
+  void _startManualDrainTracking() {
+    _isPump1ManuallyActive = true;
+    _manualDrainTrackingTimer?.cancel();
+    _manualDrainTrackingTimer =
+        Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      final isAutoCycle = widget.status?.autoCycle?.active ?? false;
+      final isPump1On =
+          (_isPump1ManuallyActive || (widget.status?.pump?.active ?? false)) &&
+              !isAutoCycle &&
+              !_isDrainingToEmpty;
+      if (!isPump1On) {
+        _stopManualDrainTracking();
+        return;
+      }
+
+      final speed = widget.status?.pump?.speed ?? _drainSpeed;
+      final effectiveSpeed = speed < 10 ? 80 : speed;
+      final mlPerSec = (_pumpLpm * (effectiveSpeed / 100.0) * 1000.0) / 60.0;
+      final drainedMlThisSecond = mlPerSec.round();
+
+      setState(() {
+        _manualDrainElapsedSec++;
+        _currentWaterLevelMl =
+            math.max(0, _currentWaterLevelMl - drainedMlThisSecond);
+      });
+      _saveCurrentWaterLevel();
+    });
+  }
+
+  void _stopManualDrainTracking() {
+    _isPump1ManuallyActive = false;
+    if (_manualDrainTrackingTimer != null) {
+      _manualDrainTrackingTimer?.cancel();
+      _manualDrainTrackingTimer = null;
+      if (_manualDrainElapsedSec > 0) {
+        final drainedTotal = (_manualDrainElapsedSec *
+                ((_pumpLpm * (_drainSpeed / 100.0) * 1000.0) / 60.0))
+            .round();
+        LogService().addLog(
+          '💧 Manual Drain Ended',
+          'Drain pump was ON for ${_manualDrainElapsedSec}s (drained ~$drainedTotal mL). Current bowl water level: $_currentWaterLevelMl mL.',
+          type: 'clean',
+        );
+        setState(() {
+          _manualDrainElapsedSec = 0;
+        });
+      }
+    }
+  }
+
+  void _startManualRefillTracking() {
+    _isPump2ManuallyActive = true;
+    _manualRefillTrackingTimer?.cancel();
+    _manualRefillTrackingTimer =
+        Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      final isAutoCycle = widget.status?.autoCycle?.active ?? false;
+      final isPump2On = _isPump2ManuallyActive || (widget.status?.pump2?.active ?? false);
+      if (!isPump2On || isAutoCycle) {
+        _stopManualRefillTracking();
+        return;
+      }
+
+      final speed = widget.status?.pump2?.speed ?? _fillSpeed;
+      final effectiveSpeed = speed < 10 ? 80 : speed;
+      final mlPerSec = (_pumpLpm * (effectiveSpeed / 100.0) * 1000.0) / 60.0;
+      final filledMlThisSecond = mlPerSec.round();
+
+      setState(() {
+        _manualRefillElapsedSec++;
+        _currentWaterLevelMl =
+            math.min(3000, _currentWaterLevelMl + filledMlThisSecond);
+      });
+      _saveCurrentWaterLevel();
+    });
+  }
+
+  void _stopManualRefillTracking() {
+    _isPump2ManuallyActive = false;
+    if (_manualRefillTrackingTimer != null) {
+      _manualRefillTrackingTimer?.cancel();
+      _manualRefillTrackingTimer = null;
+      if (_manualRefillElapsedSec > 0) {
+        final filledTotal = (_manualRefillElapsedSec *
+                ((_pumpLpm * (_fillSpeed / 100.0) * 1000.0) / 60.0))
+            .round();
+        LogService().addLog(
+          '🚰 Manual Refill Ended',
+          'Refill pump was ON for ${_manualRefillElapsedSec}s (filled ~$filledTotal mL). Current bowl water level: $_currentWaterLevelMl mL.',
+          type: 'clean',
+        );
+        setState(() {
+          _manualRefillElapsedSec = 0;
+        });
+      }
+    }
+  }
+
+  Future<void> _saveLastRefill(LastRefillRecord record) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          'drinker_last_refill_json', jsonEncode(record.toJson()));
+    } catch (_) {}
+  }
+
+  Future<void> _saveCurrentWaterLevel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(
+          'drinker_current_water_level_ml', _currentWaterLevelMl);
+    } catch (_) {}
+  }
+
+  int _computeSmartDrainSec({DrinkerPreset? preset, int? targetDrainMl}) {
+    if (targetDrainMl != null) {
+      if (targetDrainMl <= 0) return 0;
+      final p = preset ?? _activePreset;
+      return DrinkerPreset.computeSmartDrainSec(
+        volumeMl: targetDrainMl,
+        pumpLpm: p.pumpLpm,
+        drainSpeedPercent: p.drainSpeed,
+        safetyBufferSec: 2,
+      );
+    }
+
+    if (_currentWaterLevelMl <= 0) return 0;
+
+    // Check last fill up: if none recorded, set to 10sec default
+    if (_lastRefill != null && _lastRefill!.drainSec > 0) {
+      if (_currentWaterLevelMl < _lastRefill!.volumeMl) {
+        return math.max(
+            3,
+            (_lastRefill!.drainSec *
+                    (_currentWaterLevelMl / _lastRefill!.volumeMl))
+                .round());
+      }
+      return _lastRefill!.drainSec;
+    }
+    if (_lastRefill == null) {
+      final p = preset ?? _activePreset;
+      if (_currentWaterLevelMl < p.volumeMl) {
+        return math.max(3, (10 * (_currentWaterLevelMl / p.volumeMl)).round());
+      }
+      return 10;
+    }
+
+    final p = preset ?? _activePreset;
+    return DrinkerPreset.computeSmartDrainSec(
+      volumeMl: _currentWaterLevelMl,
+      pumpLpm: p.pumpLpm,
+      drainSpeedPercent: p.drainSpeed,
+      safetyBufferSec: 2,
+    );
+  }
+
+  Future<void> _triggerSequence(DrinkerPreset preset) async {
+    final smartDrain = _computeSmartDrainSec(preset: preset);
+    final lastMl = _currentWaterLevelMl;
+    setState(() {
+      _wasCycleActive = true;
+      _isCycleCompleted = false;
+      _cycleStartMl = 0;
+    });
+    await _apiService.triggerDrinkerAutoCycle(
+      widget.deviceUrl,
+      smartDrain,
+      preset.fillSec,
+      drainSpeed: preset.drainSpeed,
+      fillSpeed: preset.fillSpeed,
+      pauseSec: preset.pauseSec,
+    );
+    LogService().addLog(
+      '✨ Clean & Refill Started',
+      'Preset: ${preset.name} | Smart Drain ${smartDrain}s (computed from ${lastMl}mL in bowl) @ ${preset.drainSpeed}%, Settle ${preset.pauseSec}s, Refill ${preset.fillSec}s (~${preset.calculatedLiters.toStringAsFixed(2)}L) @ ${preset.fillSpeed}%',
+      type: 'clean',
+    );
+    widget.onRefresh();
+  }
+
+  void _drainBowlToEmpty() async {
+    if (_isDrainingToEmpty) return;
+
+    if (_currentWaterLevelMl <= 0) {
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFF1E293B),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: const BorderSide(color: Color(0xFF38BDF8), width: 1.0),
+          ),
+          content: const Row(
+            children: [
+              Icon(Icons.info_outline_rounded, color: Color(0xFF38BDF8), size: 18),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Drinker bowl is already marked empty (0 mL). Next flush will skip draining.',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: Colors.white,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    // Check last fill up: if none recorded, set to 10sec default!
+    final int drainSec = _lastRefill != null && _lastRefill!.drainSec > 0
+        ? (_currentWaterLevelMl < _lastRefill!.volumeMl
+            ? math.max(
+                3,
+                (_lastRefill!.drainSec *
+                        (_currentWaterLevelMl / _lastRefill!.volumeMl))
+                    .round())
+            : _lastRefill!.drainSec)
+        : 10;
+
+    final startMl = _currentWaterLevelMl > 0
+        ? _currentWaterLevelMl
+        : (_lastRefill?.volumeMl ?? _activePreset.volumeMl);
+    final activePreset = _activePreset;
+    final startProgress =
+        (startMl / activePreset.volumeMl.toDouble()).clamp(0.0, 1.0);
+
+    _drainToEmptyAnimController?.dispose();
+    _drainToEmptyAnimController = AnimationController(
+      vsync: this,
+      duration: Duration(seconds: drainSec),
+    );
+
+    _drainToEmptyProgressAnim = Tween<double>(
+      begin: startProgress,
+      end: 0.0,
+    ).animate(CurvedAnimation(
+      parent: _drainToEmptyAnimController!,
+      curve: Curves.easeInOutCubic,
+    ));
+
+    _drainToEmptyMlAnim = IntTween(
+      begin: startMl,
+      end: 0,
+    ).animate(CurvedAnimation(
+      parent: _drainToEmptyAnimController!,
+      curve: Curves.easeInOutCubic,
+    ));
+
+    setState(() {
+      _isDrainingToEmpty = true;
+      _isCycleCompleted = false;
+      _wasCycleActive = false;
+    });
+
+    _drainToEmptyAnimController!.addListener(() {
+      setState(() {});
+    });
+
+    _drainToEmptyAnimController!.addStatusListener((status) {
+      if (status == AnimationStatus.completed) {
+        if (!mounted) return;
+        setState(() {
+          _isDrainingToEmpty = false;
+          _currentWaterLevelMl = 0;
+          _isCycleCompleted = false;
+          _wasCycleActive = false;
+        });
+        _saveCurrentWaterLevel();
+
+        LogService().addLog(
+          '💧 Drinker Bowl Emptied',
+          'Drinker bowl evacuated to 0 mL (${drainSec}s drain). Next flush sequence will skip draining phase.',
+          type: 'clean',
+        );
+
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: const Color(0xFF0F172A),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+              side: const BorderSide(color: Color(0xFF34D399), width: 1.2),
+            ),
+            content: Row(
+              children: [
+                const Icon(Icons.check_circle_rounded,
+                    color: Color(0xFF34D399), size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Drinker bowl drained & marked Empty (0 mL • ${drainSec}s). Next flush will skip draining.',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: Colors.white,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    });
+
+    _drainToEmptyAnimController!.forward();
+
+    // Trigger physical drain pump on ESP8266 for the drain duration
+    try {
+      _apiService.setPumpTimer(
+        widget.deviceUrl,
+        drainSec,
+        false, // targetState: 0 (turn off after drainSec)
+        speed: _drainSpeed,
+        direction: 'fwd',
+      );
+    } catch (_) {}
+  }
+
+  void _stopDrainToEmpty() async {
+    _drainToEmptyAnimController?.stop();
+    _drainToEmptyAnimController?.reset();
+    try {
+      await _apiService.setPumpState(widget.deviceUrl, false, _drainSpeed);
+    } catch (_) {}
+    _stopManualDrainTracking();
+    _isPump1ManuallyActive = false;
+
+    final currentMl = _drainToEmptyMlAnim?.value ?? _currentWaterLevelMl;
+    setState(() {
+      _isDrainingToEmpty = false;
+      _currentWaterLevelMl = currentMl.clamp(0, _activePreset.volumeMl);
+      _isCycleCompleted = false;
+      _wasCycleActive = false;
+    });
+    await _saveCurrentWaterLevel();
+    widget.onRefresh();
+
+    LogService().addLog(
+      '🛑 Drain Evacuation Stopped',
+      'Drain to empty stopped early. Water remaining in bowl: $_currentWaterLevelMl mL.',
+      type: 'clean',
+    );
+  }
+
+
+  Future<void> _triggerRefillOnly(DrinkerPreset preset) async {
+    // Stop drain if running
+    if (_isDrainingToEmpty) {
+      _drainToEmptyAnimController?.stop();
+      _drainToEmptyAnimController?.reset();
+      try {
+        await _apiService.setPumpState(widget.deviceUrl, false, _drainSpeed);
+      } catch (_) {}
+    }
+    _stopManualDrainTracking();
+    _isPump1ManuallyActive = false;
+
+    // Calculate needed fill seconds based on current water level vs target
+    final missingMl =
+        (preset.volumeMl - _currentWaterLevelMl).clamp(0, preset.volumeMl);
+    final int fillSec = missingMl > 0
+        ? math.max(3, ((missingMl / 1000.0) / _pumpLpm * 60.0).round())
+        : preset.fillSec;
+
+    final startMl = _currentWaterLevelMl;
+
+    setState(() {
+      _wasCycleActive = true;
+      _isCycleCompleted = false;
+      _isDrainingToEmpty = false;
+      _cycleStartMl = startMl;
+    });
+
+    await _apiService.triggerDrinkerAutoCycle(
+      widget.deviceUrl,
+      0, // 0 drain seconds: SKIPS DRAIN COMPLETELY ON ESP8266!
+      fillSec,
+      drainSpeed: preset.drainSpeed,
+      fillSpeed: preset.fillSpeed,
+      pauseSec: 0,
+    );
+
+    LogService().addLog(
+      '💧 Refill Only Started',
+      'Preset: ${preset.name} | Refilling for ${fillSec}s (~${(missingMl > 0 ? missingMl : preset.volumeMl)} mL) @ ${preset.fillSpeed}% speed. Draining skipped.',
+      type: 'clean',
+    );
+    widget.onRefresh();
+  }
+
+  @override
   void dispose() {
+    _drainToEmptyAnimController?.dispose();
+    _manualDrainTrackingTimer?.cancel();
+    _manualRefillTrackingTimer?.cancel();
     _drainSecController.dispose();
     _fillSecController.dispose();
     _lpmController.dispose();
@@ -89,6 +583,19 @@ class _PumpScreenState extends State<PumpScreen> {
       orElse: () => loadedPresets.first,
     );
 
+    final lastRefillRaw = prefs.getString('drinker_last_refill_json');
+    LastRefillRecord? loadedLastRefill;
+    if (lastRefillRaw != null && lastRefillRaw.isNotEmpty) {
+      try {
+        loadedLastRefill =
+            LastRefillRecord.fromJson(jsonDecode(lastRefillRaw));
+      } catch (_) {}
+    }
+
+    final savedWaterLevel = prefs.getInt('drinker_current_water_level_ml');
+    final initialWaterLevel =
+        savedWaterLevel ?? (loadedLastRefill?.volumeMl ?? 0);
+
     setState(() {
       _pump1Name = prefs.getString('custom_pump_1_name') ??
           'Water Pump #1 (Main Drinker)';
@@ -97,6 +604,8 @@ class _PumpScreenState extends State<PumpScreen> {
 
       _presets = loadedPresets;
       _activePresetId = activePreset.id;
+      _lastRefill = loadedLastRefill;
+      _currentWaterLevelMl = initialWaterLevel;
 
       _drainSpeed = activePreset.drainSpeed;
       _fillSpeed = activePreset.fillSpeed;
@@ -540,8 +1049,18 @@ class _PumpScreenState extends State<PumpScreen> {
                       ScaffoldMessenger.of(this.context).showSnackBar(
                         SnackBar(
                           content: Text(
-                              '✅ Pump Calibrated! Flow rate set to ${(mlCollected / 10).toStringAsFixed(1)} mL/sec (${(10 / mlCollected).toStringAsFixed(3)} s/mL | ${newLpm.toStringAsFixed(2)} L/min).'),
-                          backgroundColor: const Color(0xFF10B981),
+                            '✅ Pump Calibrated! Flow rate set to ${(mlCollected / 10).toStringAsFixed(1)} mL/sec (${(10 / mlCollected).toStringAsFixed(3)} s/mL | ${newLpm.toStringAsFixed(2)} L/min).',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                          backgroundColor: const Color(0xFF059669),
+                          behavior: SnackBarBehavior.floating,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          duration: const Duration(seconds: 3),
                         ),
                       );
                     }
@@ -872,11 +1391,6 @@ class _PumpScreenState extends State<PumpScreen> {
                 currentTargetMl,
               }
             ]..sort();
-
-            double calcLiters() {
-              final fill = int.tryParse(fillCtrl.text) ?? 40;
-              return (fill / 60.0) * pumpLpm;
-            }
 
             void applyVolume(double liters, int targetMl) {
               final fill = ((liters / pumpLpm) * 60.0).round();
@@ -1424,11 +1938,20 @@ class _PumpScreenState extends State<PumpScreen> {
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
                                 content: Text(
-                                    '✅ Preset "$name" saved! (${(calcLiters() * 1000).round()} mL)'),
-                                backgroundColor: const Color(0xFF10B981),
+                                  '✅ Preset "$name" saved! ($currentTargetMl mL • ${(currentTargetMl / 1000.0).toStringAsFixed(currentTargetMl % 1000 == 0 ? 0 : (currentTargetMl % 100 == 0 ? 1 : 2))}L)',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                                backgroundColor: const Color(0xFF059669),
+                                behavior: SnackBarBehavior.floating,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
                                 action: SnackBarAction(
                                   label: '🧪 Calibrate',
-                                  textColor: Colors.white,
+                                  textColor: const Color(0xFF6EE7B7),
                                   onPressed: () => _showCalibrationWizard(),
                                 ),
                               ),
@@ -1449,40 +1972,113 @@ class _PumpScreenState extends State<PumpScreen> {
 
   Widget _buildAutoCycleCard() {
     final autoCycle = widget.status?.autoCycle;
-    final isActive = autoCycle?.active ?? false;
-    final phase = autoCycle?.phase ?? 0;
+    final isDeviceCycleActive = autoCycle?.active ?? false;
+    final isActive = isDeviceCycleActive || _isDrainingToEmpty;
+    final phase = _isDrainingToEmpty ? 1 : (autoCycle?.phase ?? 0);
 
-    String phaseText = 'STAGE 1: DRAINING OLD WATER';
+    String phaseText = _isDrainingToEmpty
+        ? 'DRAINING BOWL TO EMPTY...'
+        : 'STAGE 1: DRAINING OLD WATER';
     Color phaseColor = const Color(0xFFEF4444);
-    String activePumpDesc =
-        'Active Pump: $_pump1Name (Drain @ ${autoCycle?.drainSpeed ?? _drainSpeed}%)';
+    String activePumpDesc = _isDrainingToEmpty
+        ? 'Evacuating Drinker Bowl to 0 mL...'
+        : 'Active Pump: $_pump1Name (Drain @ ${autoCycle?.drainSpeed ?? _drainSpeed}%)';
 
-    if (phase == 2) {
-      phaseText = 'SETTLE PAUSE DELAY';
-      phaseColor = const Color(0xFFF59E0B);
-      activePumpDesc =
-          'Pausing ${_pauseSec}s to allow residual water to settle before refilling...';
-    } else if (phase == 3) {
-      phaseText = 'STAGE 2: REFILLING FRESH WATER';
-      phaseColor = const Color(0xFF10B981);
-      activePumpDesc =
-          'Active Pump: $_pump2Name (Fill @ ${autoCycle?.fillSpeed ?? _fillSpeed}%)';
+    if (!_isDrainingToEmpty) {
+      if (phase == 2) {
+        phaseText = 'SETTLE PAUSE DELAY';
+        phaseColor = const Color(0xFFF59E0B);
+        activePumpDesc =
+            'Pausing ${_pauseSec}s to allow residual water to settle before refilling...';
+      } else if (phase == 3) {
+        phaseText = 'STAGE 2: REFILLING FRESH WATER';
+        phaseColor = const Color(0xFF10B981);
+        activePumpDesc =
+            'Active Pump: $_pump2Name (Fill @ ${autoCycle?.fillSpeed ?? _fillSpeed}%)';
+      }
     }
 
+    int totalDrainSec =
+        autoCycle?.drainSec ?? (int.tryParse(_drainSecController.text) ?? 30);
+    if (totalDrainSec <= 0) totalDrainSec = 30;
     int totalFillSec =
         autoCycle?.fillSec ?? (int.tryParse(_fillSecController.text) ?? 40);
     if (totalFillSec <= 0) totalFillSec = 40;
     int remainingSec = autoCycle?.remaining ?? 0;
+    int elapsedDrainSec = (totalDrainSec - remainingSec).clamp(0, totalDrainSec);
+    double drainProgressPercent =
+        (elapsedDrainSec / totalDrainSec.toDouble()).clamp(0.0, 1.0);
     int elapsedFillSec = (totalFillSec - remainingSec).clamp(0, totalFillSec);
 
-    double refilledLiters = (elapsedFillSec / 60.0) * _pumpLpm;
-    double targetLiters = (totalFillSec / 60.0) * _pumpLpm;
-    int refilledMl = (refilledLiters * 1000).round();
-    int targetMl = (targetLiters * 1000).round();
+    final activePreset = _activePreset;
+
+    // Use activePreset's volumeMl (e.g. 1000 mL = 1.0L) so that UI volume readouts
+    // reflect the exact volume selected by the user instead of drifting to 988mL due to integer second rounding
+    final int targetVolumeMl = activePreset.volumeMl;
+    final double targetVolumeLiters = activePreset.calculatedLiters;
+
     double fillProgressPercent =
         (elapsedFillSec / totalFillSec.toDouble()).clamp(0.0, 1.0);
+    int refilledMl = _cycleStartMl +
+        (fillProgressPercent * (targetVolumeMl - _cycleStartMl)).round();
+    int targetMl = targetVolumeMl;
+    double targetLiters = targetVolumeLiters;
 
-    final activePreset = _activePreset;
+    final isDrainPumpRunningManually =
+        ((widget.status?.pump?.active ?? false) || _isPump1ManuallyActive) &&
+            !isActive;
+    final isRefillPumpRunningManually =
+        ((widget.status?.pump2?.active ?? false) || _isPump2ManuallyActive) &&
+            !isActive;
+    final smartDrainSec = _computeSmartDrainSec(preset: activePreset);
+    final effectiveDrainMlPerSec =
+        (activePreset.pumpLpm * (activePreset.drainSpeed / 100.0) * 1000.0) /
+            60.0;
+
+    final int drainToEmptySec = _lastRefill != null && _lastRefill!.drainSec > 0
+        ? (_currentWaterLevelMl < _lastRefill!.volumeMl
+            ? math.max(
+                3,
+                (_lastRefill!.drainSec *
+                        (_currentWaterLevelMl / _lastRefill!.volumeMl))
+                    .round())
+            : _lastRefill!.drainSec)
+        : 10;
+    final int drainToEmptyRemainingSec = _isDrainingToEmpty
+        ? (drainToEmptySec -
+                ((_drainToEmptyAnimController?.value ?? 0.0) * drainToEmptySec)
+                    .round())
+            .clamp(0, drainToEmptySec)
+        : 0;
+
+    final double effectiveDisplayProgress = _isDrainingToEmpty
+        ? (_drainToEmptyProgressAnim?.value ?? 0.0)
+        : (isDeviceCycleActive
+            ? (phase == 1
+                ? (1.0 - drainProgressPercent)
+                : (phase == 2
+                    ? 0.08
+                    : ((_cycleStartMl / targetVolumeMl.toDouble()) +
+                            (fillProgressPercent *
+                                (1.0 -
+                                    (_cycleStartMl /
+                                        targetVolumeMl.toDouble()))))
+                        .clamp(0.0, 1.0)))
+            : (_currentWaterLevelMl <= 0
+                ? 0.0
+                : (isDrainPumpRunningManually || isRefillPumpRunningManually
+                    ? (_currentWaterLevelMl / activePreset.volumeMl.toDouble()).clamp(0.0, 1.0)
+                    : (_isCycleCompleted
+                        ? 1.0
+                        : (_currentWaterLevelMl / activePreset.volumeMl.toDouble()).clamp(0.0, 1.0)))));
+
+    final int? effectiveDisplayMl = _isDrainingToEmpty
+        ? _drainToEmptyMlAnim?.value
+        : (isDeviceCycleActive
+            ? (phase == 3 ? refilledMl : null)
+            : _currentWaterLevelMl);
+
+    final int currentOrAnimMl = effectiveDisplayMl ?? _currentWaterLevelMl;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
@@ -1493,21 +2089,40 @@ class _PumpScreenState extends State<PumpScreen> {
         border: Border.all(
           color: isActive
               ? phaseColor.withValues(alpha: 0.6)
-              : const Color(0xFF38BDF8).withValues(alpha: 0.25),
-          width: 1.5,
+              : (isDrainPumpRunningManually
+                  ? const Color(0xFFEF4444).withValues(alpha: 0.7)
+                  : (isRefillPumpRunningManually
+                      ? const Color(0xFF10B981).withValues(alpha: 0.7)
+                      : (_currentWaterLevelMl <= 0
+                          ? const Color(0xFFEF4444).withValues(alpha: 0.3)
+                          : (_isCycleCompleted
+                              ? const Color(0xFF10B981).withValues(alpha: 0.5)
+                              : const Color(0xFF38BDF8).withValues(alpha: 0.3))))),
+          width: (isDrainPumpRunningManually || isRefillPumpRunningManually) ? 2.0 : 1.5,
         ),
         boxShadow: [
-          if (isActive)
-            BoxShadow(
-              color: phaseColor.withValues(alpha: 0.2),
-              blurRadius: 16,
-              spreadRadius: 2,
-            ),
+          BoxShadow(
+            color: (isActive
+                    ? phaseColor
+                    : (isDrainPumpRunningManually
+                        ? const Color(0xFFEF4444)
+                        : (isRefillPumpRunningManually
+                            ? const Color(0xFF10B981)
+                            : (_currentWaterLevelMl <= 0
+                                ? const Color(0xFFEF4444)
+                                : (_isCycleCompleted
+                                    ? const Color(0xFF10B981)
+                                    : const Color(0xFF38BDF8))))))
+                .withValues(alpha: 0.15),
+            blurRadius: 18,
+            spreadRadius: 1,
+          ),
         ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header Row with Status Pill
           Row(
             children: [
               Container(
@@ -1515,12 +2130,40 @@ class _PumpScreenState extends State<PumpScreen> {
                 decoration: BoxDecoration(
                   color: isActive
                       ? phaseColor.withValues(alpha: 0.2)
-                      : const Color(0xFF38BDF8).withValues(alpha: 0.15),
+                      : (isDrainPumpRunningManually
+                          ? const Color(0xFFEF4444).withValues(alpha: 0.2)
+                          : (isRefillPumpRunningManually
+                              ? const Color(0xFF10B981).withValues(alpha: 0.2)
+                              : (_currentWaterLevelMl <= 0
+                                  ? const Color(0xFFEF4444).withValues(alpha: 0.2)
+                                  : (_isCycleCompleted
+                                      ? const Color(0xFF10B981).withValues(alpha: 0.2)
+                                      : const Color(0xFF38BDF8).withValues(alpha: 0.15))))),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(
-                  isActive ? Icons.cleaning_services : Icons.autorenew_rounded,
-                  color: isActive ? phaseColor : const Color(0xFF38BDF8),
+                  isActive
+                      ? Icons.cleaning_services_rounded
+                      : (isDrainPumpRunningManually
+                          ? Icons.water_damage_rounded
+                          : (isRefillPumpRunningManually
+                              ? Icons.water_drop_rounded
+                              : (_currentWaterLevelMl <= 0
+                                  ? Icons.warning_amber_rounded
+                                  : (_isCycleCompleted
+                                      ? Icons.check_circle_rounded
+                                      : Icons.autorenew_rounded)))),
+                  color: isActive
+                      ? phaseColor
+                      : (isDrainPumpRunningManually
+                          ? const Color(0xFFEF4444)
+                          : (isRefillPumpRunningManually
+                              ? const Color(0xFF10B981)
+                              : (_currentWaterLevelMl <= 0
+                                  ? const Color(0xFFEF4444)
+                                  : (_isCycleCompleted
+                                      ? const Color(0xFF10B981)
+                                      : const Color(0xFF38BDF8))))),
                   size: 24,
                 ),
               ),
@@ -1539,148 +2182,167 @@ class _PumpScreenState extends State<PumpScreen> {
                     const SizedBox(height: 2),
                     Text(
                       isActive
-                          ? 'Sequence Active (${remainingSec}s left)'
-                          : 'Stage 1: Drain ➔ ${_pauseSec}s Settle Delay ➔ Stage 2: Refill',
+                          ? (_isDrainingToEmpty
+                              ? 'Evacuating Drinker Bowl (${drainToEmptyRemainingSec}s left • $currentOrAnimMl mL)...'
+                              : 'Sequence Active (${remainingSec}s left)')
+                          : (isDrainPumpRunningManually
+                              ? 'Manual Drain Active (${_manualDrainElapsedSec}s) • Evacuating water...'
+                              : (isRefillPumpRunningManually
+                                  ? 'Manual Refill Active (${_manualRefillElapsedSec}s) • Adding water...'
+                                  : (_currentWaterLevelMl <= 0
+                                      ? 'Drinker Bowl Empty (0 mL) • Ready to Refill'
+                                      : (_isCycleCompleted
+                                          ? 'Drinker Refilled & Ready'
+                                          : 'Bowl Level: $_currentWaterLevelMl mL • Stage 1: Drain ➔ Settle ➔ Stage 2: Refill')))),
                       style: const TextStyle(
                           color: Color(0xFF94A3B8), fontSize: 11),
                     ),
                   ],
                 ),
               ),
+              // Status Pill Badge
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isActive
+                      ? phaseColor.withValues(alpha: 0.2)
+                      : (_currentWaterLevelMl <= 0
+                          ? const Color(0xFFEF4444).withValues(alpha: 0.2)
+                          : (isDrainPumpRunningManually
+                              ? const Color(0xFFEF4444).withValues(alpha: 0.2)
+                              : (isRefillPumpRunningManually
+                                  ? const Color(0xFF10B981).withValues(alpha: 0.2)
+                                  : (_isCycleCompleted
+                                      ? const Color(0xFF10B981).withValues(alpha: 0.2)
+                                      : const Color(0xFF38BDF8).withValues(alpha: 0.15))))),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: isActive
+                        ? phaseColor.withValues(alpha: 0.5)
+                        : (_currentWaterLevelMl <= 0
+                            ? const Color(0xFFEF4444).withValues(alpha: 0.6)
+                            : (isDrainPumpRunningManually
+                                ? const Color(0xFFEF4444).withValues(alpha: 0.6)
+                                : (isRefillPumpRunningManually
+                                    ? const Color(0xFF10B981).withValues(alpha: 0.6)
+                                    : (_isCycleCompleted
+                                        ? const Color(0xFF10B981).withValues(alpha: 0.5)
+                                        : const Color(0xFF38BDF8).withValues(alpha: 0.4))))),
+                    width: 1,
+                  ),
+                ),
+                child: Text(
+                  isActive
+                      ? (_isDrainingToEmpty
+                          ? 'DRAINING (${drainToEmptyRemainingSec}s)'
+                          : (phase == 1
+                              ? 'DRAINING'
+                              : (phase == 2 ? 'SETTLING' : 'REFILLING')))
+                      : (_currentWaterLevelMl <= 0
+                          ? 'DRY / EMPTY'
+                          : (isDrainPumpRunningManually
+                              ? 'MANUAL DRAIN'
+                              : (isRefillPumpRunningManually
+                                  ? 'MANUAL REFILL'
+                                  : (_isCycleCompleted ? 'COMPLETED' : 'READY')))),
+                  style: TextStyle(
+                    color: isActive
+                        ? phaseColor
+                        : (_currentWaterLevelMl <= 0
+                            ? const Color(0xFFEF4444)
+                            : (isDrainPumpRunningManually
+                                ? const Color(0xFFEF4444)
+                                : (isRefillPumpRunningManually
+                                    ? const Color(0xFF10B981)
+                                    : (_isCycleCompleted
+                                        ? const Color(0xFF10B981)
+                                        : const Color(0xFF38BDF8))))),
+                    fontWeight: FontWeight.w800,
+                    fontSize: 10,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 14),
-          if (isActive) ...[
-            // Active 2-Stage Progress Banner
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0F172A),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: phaseColor.withValues(alpha: 0.5)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: phaseColor.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Text(
-                          phaseText,
-                          style: TextStyle(
-                            color: phaseColor,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ),
-                      Text(
-                        '${remainingSec}s left',
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    activePumpDesc,
-                    style:
-                        const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
-                  ),
-                  const SizedBox(height: 10),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(6),
-                    child: LinearProgressIndicator(
-                      value: phase == 3 ? fillProgressPercent : null,
-                      backgroundColor: const Color(0xFF334155),
-                      valueColor: AlwaysStoppedAnimation<Color>(phaseColor),
-                      minHeight: 6,
-                    ),
-                  ),
 
-                  // Live Refill Volume Gauge (Stage 2 Filling)
-                  if (phase == 3) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF0EA5E9).withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                            color:
-                                const Color(0xFF34D399).withValues(alpha: 0.4)),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              const Row(
-                                children: [
-                                  Icon(Icons.water_drop_rounded,
-                                      color: Color(0xFF34D399), size: 18),
-                                  SizedBox(width: 6),
-                                  Text(
-                                    'Live Water Refill Progress:',
-                                    style: TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 12),
-                                  ),
-                                ],
-                              ),
-                              Text(
-                                '${(fillProgressPercent * 100).toStringAsFixed(1)}% Filled',
-                                style: const TextStyle(
-                                    color: Color(0xFF34D399),
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 12),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            '💧 $refilledMl mL / $targetMl mL  (~${refilledLiters.toStringAsFixed(2)} L of ${targetLiters.toStringAsFixed(2)} L)',
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w800,
-                                fontSize: 14),
-                          ),
-                          const SizedBox(height: 8),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(6),
-                            child: LinearProgressIndicator(
-                              value: fillProgressPercent,
-                              backgroundColor: const Color(0xFF334155),
-                              valueColor: const AlwaysStoppedAnimation<Color>(
-                                  Color(0xFF34D399)),
-                              minHeight: 8,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Pump Flow Rate: ${_pumpLpm.toStringAsFixed(1)} L/min (~${(_pumpLpm * 1000 / 60).round()} mL/sec)',
-                            style: const TextStyle(
-                                color: Color(0xFF94A3B8), fontSize: 11),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ],
-              ),
+          const SizedBox(height: 16),
+
+          // Central 3D Cylinder Liquid Wave Tank (Permanently visible in all states!)
+          Center(
+            child: CylinderWaterTankWidget(
+              progress: effectiveDisplayProgress,
+              phase: isActive
+                  ? phase
+                  : (_currentWaterLevelMl <= 0
+                      ? 0
+                      : (isDrainPumpRunningManually
+                          ? 1
+                          : (isRefillPumpRunningManually
+                              ? 3
+                              : (_isCycleCompleted ? 4 : 0)))),
+              phaseText: isActive
+                  ? (_isDrainingToEmpty
+                      ? 'DRAINING BOWL TO EMPTY (${drainToEmptyRemainingSec}s)'
+                      : phaseText)
+                  : (_currentWaterLevelMl <= 0
+                      ? 'DRINKER BOWL DRY'
+                      : (isDrainPumpRunningManually
+                          ? 'MANUAL DRAIN ACTIVE'
+                          : (isRefillPumpRunningManually
+                              ? 'MANUAL REFILL ACTIVE'
+                              : (_isCycleCompleted
+                                  ? 'CYCLE COMPLETED'
+                                  : (_lastRefill != null
+                                      ? 'LAST REFILL: ${_lastRefill!.timeAgo.toUpperCase()}'
+                                      : 'PRESET: ${activePreset.volumeChipLabel}'))))),
+              remainingSec: isDeviceCycleActive
+                  ? remainingSec
+                  : (_isDrainingToEmpty
+                      ? drainToEmptyRemainingSec
+                      : (isDrainPumpRunningManually
+                          ? _manualDrainElapsedSec
+                          : (isRefillPumpRunningManually ? _manualRefillElapsedSec : 0))),
+              currentMl: effectiveDisplayMl,
+              targetMl: isActive
+                  ? (phase == 3 ? targetMl : null)
+                  : (_isCycleCompleted
+                      ? targetMl
+                      : activePreset.volumeMl),
+              currentLiters: effectiveDisplayMl != null
+                  ? effectiveDisplayMl / 1000.0
+                  : null,
+              targetLiters: isActive
+                  ? (phase == 3 ? targetLiters : null)
+                  : (_isCycleCompleted
+                      ? targetLiters
+                      : activePreset.calculatedLiters),
+              flowRateLpm: _pumpLpm,
+              pumpName: isActive
+                  ? activePumpDesc
+                  : (_currentWaterLevelMl <= 0
+                      ? 'Drinker Empty • Needs Refill'
+                      : (isDrainPumpRunningManually
+                          ? '$_pump1Name (Draining)'
+                          : (isRefillPumpRunningManually
+                              ? '$_pump2Name (Refilling)'
+                              : (_isCycleCompleted
+                                  ? '✓ Drinker Refilled & Ready'
+                                  : (_lastRefill != null
+                                      ? 'Last: ${_lastRefill!.presetName}'
+                                      : 'Preset: ${activePreset.name} (${activePreset.volumeChipLabel})'))))),
+              lastRefill: _lastRefill,
+              smartDrainSec: smartDrainSec,
+              width: 210,
+              height: 250,
             ),
-            const SizedBox(height: 12),
+          ),
+
+          const SizedBox(height: 16),
+
+          // Controls & Action Area
+          if (isDeviceCycleActive) ...[
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
@@ -1690,13 +2352,17 @@ class _PumpScreenState extends State<PumpScreen> {
                   foregroundColor: const Color(0xFFFCA5A5),
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12)),
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  padding: const EdgeInsets.symmetric(vertical: 13),
                 ),
                 icon: const Icon(Icons.stop_circle, size: 20),
                 label: const Text('Cancel Active Flush & Refill Sequence',
                     style: TextStyle(fontWeight: FontWeight.bold)),
                 onPressed: () async {
                   await _apiService.stopDrinkerAutoCycle(widget.deviceUrl);
+                  setState(() {
+                    _wasCycleActive = false;
+                    _isCycleCompleted = false;
+                  });
                   LogService().addLog(
                     '🛑 Clean & Refill Cancelled',
                     'Sequence manually stopped by user.',
@@ -1706,42 +2372,493 @@ class _PumpScreenState extends State<PumpScreen> {
                 },
               ),
             ),
-          ] else ...[
-            // Active Preset Selector & Volume Chips Card
+          ],
+          if (!isDeviceCycleActive &&
+              _isCycleCompleted &&
+              _currentWaterLevelMl > 0 &&
+              !_isDrainingToEmpty) ...[
             Container(
-              padding: const EdgeInsets.all(14),
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
-                color: const Color(0xFF0F172A),
+                color: const Color(0xFF10B981).withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: const Color(0xFF10B981).withValues(alpha: 0.5),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.check_circle_rounded,
+                      color: Color(0xFF34D399), size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Drinker cycle completed! Bowl refilled with fresh water (~$currentOrAnimMl mL).',
+                      style: const TextStyle(
+                        color: Color(0xFF34D399),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded,
+                        color: Color(0xFF94A3B8), size: 16),
+                    onPressed: () {
+                      setState(() {
+                        _isCycleCompleted = false;
+                        _wasCycleActive = false;
+                      });
+                    },
+                    tooltip: 'Dismiss',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
+              ),
+            ),
+          ],
+            if (_isDrainingToEmpty) ...[
+              Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEF4444).withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: const Color(0xFFEF4444).withValues(alpha: 0.4),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.2,
+                        color: Color(0xFFEF4444),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Draining Drinker Bowl to Empty... (${drainToEmptyRemainingSec}s left • $currentOrAnimMl mL)',
+                        style: const TextStyle(
+                          color: Color(0xFFFCA5A5),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            // Default View: Drinker Bowl Water Monitor & Smart Check Banner
+            Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [
+                    Color(0xFF0F172A),
+                    Color(0xFF1E293B),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
                 borderRadius: BorderRadius.circular(14),
                 border: Border.all(
-                    color: const Color(0xFF38BDF8).withValues(alpha: 0.3)),
+                  color: isDrainPumpRunningManually || _isDrainingToEmpty
+                      ? const Color(0xFFEF4444).withValues(alpha: 0.6)
+                      : const Color(0xFF38BDF8).withValues(alpha: 0.35),
+                  width: 1.2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: (isDrainPumpRunningManually || _isDrainingToEmpty
+                            ? const Color(0xFFEF4444)
+                            : const Color(0xFF38BDF8))
+                        .withValues(alpha: 0.08),
+                    blurRadius: 10,
+                    offset: const Offset(0, 3),
+                  ),
+                ],
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: (isDrainPumpRunningManually || _isDrainingToEmpty
+                                  ? const Color(0xFFEF4444)
+                                  : const Color(0xFF38BDF8))
+                              .withValues(alpha: 0.15),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          isDrainPumpRunningManually || _isDrainingToEmpty
+                              ? Icons.water_damage_rounded
+                              : Icons.sensors_rounded,
+                          color: isDrainPumpRunningManually || _isDrainingToEmpty
+                              ? const Color(0xFFEF4444)
+                              : const Color(0xFF38BDF8),
+                          size: 15,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
                       Expanded(
-                        child: Row(
-                          children: [
-                            const Icon(Icons.bookmark_added_rounded,
-                                color: Color(0xFF38BDF8), size: 18),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(
-                                'REFILL PRESET: ${activePreset.volumeChipLabel}',
-                                overflow: TextOverflow.ellipsis,
+                        child: Text(
+                          isDrainPumpRunningManually
+                              ? 'MANUAL DRAIN IN PROGRESS'
+                              : (_isDrainingToEmpty
+                                  ? 'DRAINING TO EMPTY (${drainToEmptyRemainingSec}s • $currentOrAnimMl mL)'
+                                  : 'DRINKER BOWL MONITOR'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: isDrainPumpRunningManually || _isDrainingToEmpty
+                                ? const Color(0xFFEF4444)
+                                : const Color(0xFF38BDF8),
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                      if (_lastRefill != null) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF10B981).withValues(alpha: 0.18),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: const Color(0xFF10B981).withValues(alpha: 0.5),
+                              width: 0.8,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.history_rounded,
+                                  color: Color(0xFF34D399), size: 12),
+                              const SizedBox(width: 4),
+                              Text(
+                                _lastRefill!.timeAgo,
                                 style: const TextStyle(
-                                  color: Color(0xFF38BDF8),
-                                  fontSize: 11,
+                                  color: Color(0xFF34D399),
                                   fontWeight: FontWeight.bold,
-                                  letterSpacing: 0.6,
+                                  fontSize: 10.5,
                                 ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0B1120),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: const Color(0xFF334155).withValues(alpha: 0.6),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        _buildMiniRefillStat(
+                          label: 'CURRENT IN BOWL',
+                          value: '$currentOrAnimMl mL',
+                          sub: currentOrAnimMl <= 0
+                              ? 'Bowl Empty'
+                              : (_isDrainingToEmpty
+                                  ? 'Draining to 0 mL...'
+                                  : (_lastRefill != null && currentOrAnimMl < _lastRefill!.volumeMl
+                                      ? '-${_lastRefill!.volumeMl - currentOrAnimMl} mL drained'
+                                      : '~${(currentOrAnimMl / 1000.0).toStringAsFixed(2)} L')),
+                          icon: currentOrAnimMl <= 0
+                              ? Icons.warning_amber_rounded
+                              : (_isDrainingToEmpty
+                                  ? Icons.water_damage_rounded
+                                  : Icons.water_drop_rounded),
+                          iconColor: currentOrAnimMl <= 0 || _isDrainingToEmpty
+                              ? const Color(0xFFEF4444)
+                              : (isDrainPumpRunningManually
+                                  ? const Color(0xFFF97316)
+                                  : const Color(0xFF38BDF8)),
+                        ),
+                        Container(
+                            width: 1,
+                            height: 28,
+                            color: const Color(0xFF334155)),
+                        _buildMiniRefillStat(
+                          label: 'LAST REFILL',
+                          value: _lastRefill != null ? '${_lastRefill!.volumeMl} mL' : 'None (10s Default)',
+                          sub: _lastRefill?.presetName ?? 'No prior fill recorded',
+                          icon: Icons.bookmarks_rounded,
+                          iconColor: const Color(0xFFA78BFA),
+                        ),
+                        Container(
+                            width: 1,
+                            height: 28,
+                            color: const Color(0xFF334155)),
+                        _buildMiniRefillStat(
+                          label: 'DRAIN RATE',
+                          value: '${effectiveDrainMlPerSec.toStringAsFixed(1)} mL/s',
+                          sub: '@ ${activePreset.drainSpeed}% speed',
+                          icon: Icons.speed_rounded,
+                          iconColor: const Color(0xFF34D399),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // Smart Drain Computation Explanation
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0F172A),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: currentOrAnimMl <= 0
+                            ? const Color(0xFF10B981).withValues(alpha: 0.4)
+                            : (_isDrainingToEmpty
+                                ? const Color(0xFFEF4444).withValues(alpha: 0.4)
+                                : const Color(0xFF38BDF8).withValues(alpha: 0.3)),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(
+                            color: (currentOrAnimMl <= 0
+                                    ? const Color(0xFF10B981)
+                                    : (_isDrainingToEmpty
+                                        ? const Color(0xFFEF4444)
+                                        : const Color(0xFF38BDF8)))
+                                .withValues(alpha: 0.15),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            currentOrAnimMl <= 0
+                                ? Icons.check_circle_rounded
+                                : (_isDrainingToEmpty
+                                    ? Icons.water_damage_rounded
+                                    : Icons.auto_awesome_rounded),
+                            color: currentOrAnimMl <= 0
+                                ? const Color(0xFF34D399)
+                                : (_isDrainingToEmpty
+                                    ? const Color(0xFFEF4444)
+                                    : const Color(0xFF38BDF8)),
+                            size: 14,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      currentOrAnimMl <= 0
+                                          ? 'SMART DRAIN: 0s (BOWL EMPTY)'
+                                          : (_isDrainingToEmpty
+                                              ? 'DRAINING TO EMPTY IN PROGRESS'
+                                              : (_lastRefill != null
+                                                  ? 'SMART DRAIN (LAST: ${_lastRefill!.volumeMl} mL)'
+                                                  : 'SMART DRAIN (DEFAULT: 10s)')),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        color: currentOrAnimMl <= 0
+                                            ? const Color(0xFF34D399)
+                                            : (_isDrainingToEmpty
+                                                ? const Color(0xFFFCA5A5)
+                                                : const Color(0xFF38BDF8)),
+                                        fontSize: 9.5,
+                                        fontWeight: FontWeight.w800,
+                                        letterSpacing: 0.3,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    currentOrAnimMl <= 0
+                                        ? '0s (Dry)'
+                                        : (_isDrainingToEmpty
+                                            ? '${drainToEmptyRemainingSec}s left'
+                                            : '${smartDrainSec}s to drain'),
+                                    style: TextStyle(
+                                      color: currentOrAnimMl <= 0
+                                          ? const Color(0xFF94A3B8)
+                                          : (_isDrainingToEmpty
+                                              ? const Color(0xFFFCA5A5)
+                                              : const Color(0xFF34D399)),
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                currentOrAnimMl <= 0
+                                    ? 'Bowl is dry. Next flush skips drain phase and refills fresh water immediately.'
+                                    : (_isDrainingToEmpty
+                                        ? 'Evacuating drinker bowl to 0 mL (${drainToEmptySec}s duration). Bowl will be marked dry upon completion.'
+                                        : (_lastRefill != null
+                                            ? 'Evacuating last fill (${_lastRefill!.volumeMl} mL) in ${smartDrainSec}s @ ${activePreset.drainSpeed}% speed + air purge'
+                                            : 'No prior fill recorded. Using default 10s drain duration to evacuate bowl.')),
+                                style: const TextStyle(
+                                  color: Color(0xFF94A3B8),
+                                  fontSize: 9.5,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Quick Calibration Action Buttons
+                  const SizedBox(height: 10),
+                  Wrap(
+                    alignment: WrapAlignment.end,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: [
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFFF87171),
+                          side: BorderSide(
+                            color: currentOrAnimMl == 0
+                                ? const Color(0xFFEF4444)
+                                : const Color(0xFFEF4444).withValues(alpha: 0.4),
+                            width: currentOrAnimMl == 0 ? 1.5 : 1.0,
+                          ),
+                          backgroundColor: currentOrAnimMl == 0
+                              ? const Color(0xFFEF4444).withValues(alpha: 0.2)
+                              : const Color(0xFFEF4444).withValues(alpha: 0.08),
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: _isDrainingToEmpty
+                            ? const SizedBox(
+                                width: 13,
+                                height: 13,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Color(0xFFEF4444),
+                                ),
+                              )
+                            : Icon(
+                                currentOrAnimMl == 0
+                                    ? Icons.check_circle_outline_rounded
+                                    : Icons.remove_circle_outline_rounded,
+                                size: 13,
+                              ),
+                        label: Text(
+                          _isDrainingToEmpty
+                              ? 'Draining Bowl (${drainToEmptyRemainingSec}s)...'
+                              : (currentOrAnimMl == 0
+                                  ? 'Bowl is Empty (0 mL)'
+                                  : 'Set Empty (0 mL)'),
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 10.5),
+                        ),
+                        onPressed: _isDrainingToEmpty
+                            ? _stopDrainToEmpty
+                            : _drainBowlToEmpty,
+                      ),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF34D399),
+                          side: const BorderSide(
+                            color: Color(0xFF10B981),
+                            width: 1.0,
+                          ),
+                          backgroundColor:
+                              const Color(0xFF10B981).withValues(alpha: 0.1),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 7),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.water_drop_rounded,
+                            size: 13, color: Color(0xFF34D399)),
+                        label: Text(
+                          activePreset.volumeMl > currentOrAnimMl
+                              ? 'Refill (+${activePreset.volumeMl - currentOrAnimMl} mL)'
+                              : 'Refill Bowl',
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 10.5),
+                        ),
+                        onPressed: (isDeviceCycleActive ||
+                                currentOrAnimMl >=
+                                    (_lastRefill?.volumeMl ??
+                                        activePreset.volumeMl))
+                            ? null
+                            : () => _triggerRefillOnly(activePreset),
+                      ),
+
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            // Default View: Redesigned Volume Preset Selector & Sequence Specs
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F172A),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                    color: const Color(0xFF38BDF8).withValues(alpha: 0.2)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Row: Title & Manage Presets
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.bookmarks_rounded,
+                              color: Color(0xFF38BDF8), size: 16),
+                          SizedBox(width: 6),
+                          Text(
+                            'SELECT REFILL VOLUME',
+                            style: TextStyle(
+                              color: Color(0xFF38BDF8),
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 0.6,
+                            ),
+                          ),
+                        ],
                       ),
                       OutlinedButton.icon(
                         style: OutlinedButton.styleFrom(
@@ -1765,7 +2882,7 @@ class _PumpScreenState extends State<PumpScreen> {
                   ),
                   const SizedBox(height: 10),
 
-                  // Volume Chips Selector Row
+                  // Horizontal Preset Choice Chips
                   SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: Row(
@@ -1834,46 +2951,54 @@ class _PumpScreenState extends State<PumpScreen> {
 
                   const SizedBox(height: 12),
 
-                  // Selected Preset Parameters Detail Box
+                  // 3-Step Sequence Specs Bar (Drain ➔ Settle ➔ Refill)
                   Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 10),
                     decoration: BoxDecoration(
                       color: const Color(0xFF1E293B),
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: const Color(0xFF334155)),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
                       children: [
-                        Row(
-                          children: [
-                            const Icon(Icons.water_drop_rounded,
-                                color: Color(0xFF34D399), size: 16),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(
-                                'Volume: ${activePreset.volumeMl} mL (~${activePreset.calculatedLiters.toStringAsFixed(2)} L)',
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Color(0xFF34D399),
-                                  fontWeight: FontWeight.w800,
-                                  fontSize: 13,
-                                ),
-                              ),
-                            ),
-                          ],
+                        // Drain Step (Smart computed from remaining water in bowl)
+                        _buildStepMetric(
+                          icon: Icons.cleaning_services_rounded,
+                          iconColor: const Color(0xFFEF4444),
+                          title: 'Stage 1: Drain',
+                          value: '${smartDrainSec}s',
+                          sub: currentOrAnimMl <= 0
+                              ? 'Dry (Skip)'
+                              : 'Smart (${currentOrAnimMl}mL)',
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '💧 Fill Pump #2: ${activePreset.fillSec}s @ ${activePreset.fillSpeed}%\n'
-                          '🌊 Drain Pump #1: ${activePreset.drainSec}s @ ${activePreset.drainSpeed}%\n'
-                          '⏸️ Settle Pause: ${activePreset.pauseSec}s delay  •  Rate: ${activePreset.pumpLpm.toStringAsFixed(1)} L/min (~${(activePreset.pumpLpm * 1000 / 60).round()} mL/s)',
-                          style: const TextStyle(
-                            color: Color(0xFF94A3B8),
-                            fontSize: 11,
-                            height: 1.4,
-                          ),
+                        Container(
+                          width: 1,
+                          height: 30,
+                          color: const Color(0xFF334155),
+                        ),
+                        // Settle Step
+                        _buildStepMetric(
+                          icon: Icons.hourglass_top_rounded,
+                          iconColor: const Color(0xFFF59E0B),
+                          title: 'Pause Delay',
+                          value: '${activePreset.pauseSec}s',
+                          sub: 'Settle residual',
+                        ),
+                        Container(
+                          width: 1,
+                          height: 30,
+                          color: const Color(0xFF334155),
+                        ),
+                        // Refill Step
+                        _buildStepMetric(
+                          icon: Icons.water_drop_rounded,
+                          iconColor: const Color(0xFF10B981),
+                          title: 'Stage 2: Refill',
+                          value: '${activePreset.fillSec}s',
+                          sub:
+                              '~${activePreset.calculatedLiters.toStringAsFixed(2)} L',
                         ),
                       ],
                     ),
@@ -1884,44 +3009,212 @@ class _PumpScreenState extends State<PumpScreen> {
 
             const SizedBox(height: 14),
 
-            // Action Button: Clean & Refill
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF10B981),
-                  foregroundColor: const Color(0xFF0F172A),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  padding: const EdgeInsets.symmetric(vertical: 14),
+            if (_isDrainingToEmpty) ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFDC2626),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    elevation: 4,
+                    shadowColor: const Color(0xFFDC2626).withValues(alpha: 0.4),
+                  ),
+                  icon: const Icon(Icons.stop_circle_rounded, size: 22),
+                  label: Text(
+                    'Stop Draining Early (${drainToEmptyRemainingSec}s left • $currentOrAnimMl mL in bowl)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 13.5,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  onPressed: _stopDrainToEmpty,
                 ),
-                icon: const Icon(Icons.play_arrow_rounded, size: 22),
-                label: Text(
-                  '✨ Clean & Refill (${activePreset.name})',
+              ),
+            ] else if (currentOrAnimMl <= 0) ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF10B981),
+                    foregroundColor: const Color(0xFF0F172A),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    elevation: 4,
+                    shadowColor: const Color(0xFF10B981).withValues(alpha: 0.4),
+                  ),
+                  icon: const Icon(Icons.water_drop_rounded, size: 22),
+                  label: Text(
+                    'Start Refill (${activePreset.volumeChipLabel} • ${activePreset.volumeMl} mL)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 14,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  onPressed: () => _triggerRefillOnly(activePreset),
+                ),
+              ),
+            ] else ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF10B981),
+                    foregroundColor: const Color(0xFF0F172A),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    elevation: 4,
+                    shadowColor: const Color(0xFF10B981).withValues(alpha: 0.4),
+                  ),
+                  icon: const Icon(Icons.water_drop_rounded, size: 22),
+                  label: Text(
+                    activePreset.volumeMl > currentOrAnimMl
+                        ? 'Refill Drinker Bowl (+${activePreset.volumeMl - currentOrAnimMl} mL • Skip Drain)'
+                        : 'Top-Up Drinker Bowl (${activePreset.volumeChipLabel} • Skip Drain)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 13.5,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  onPressed: () => _triggerRefillOnly(activePreset),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF38BDF8),
+                    side: const BorderSide(color: Color(0xFF0284C7), width: 1.3),
+                    backgroundColor: const Color(0xFF0284C7).withValues(alpha: 0.08),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  icon: const Icon(Icons.cleaning_services_rounded, size: 18),
+                  label: Text(
+                    'Full Flush (${smartDrainSec}s) & Refill (${activePreset.volumeChipLabel})',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12.5,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                  onPressed: () => _triggerSequence(activePreset),
+                ),
+              ),
+            ],
+          ],
+      ),
+    );
+  }
+
+  Widget _buildMiniRefillStat({
+    required String label,
+    required String value,
+    required String sub,
+    required IconData icon,
+    required Color iconColor,
+  }) {
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: iconColor, size: 11),
+              const SizedBox(width: 3),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                      fontWeight: FontWeight.w800, fontSize: 14),
+                    color: Color(0xFF94A3B8),
+                    fontSize: 8.5,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.2,
+                  ),
                 ),
-                onPressed: () async {
-                  await _apiService.triggerDrinkerAutoCycle(
-                    widget.deviceUrl,
-                    activePreset.drainSec,
-                    activePreset.fillSec,
-                    drainSpeed: activePreset.drainSpeed,
-                    fillSpeed: activePreset.fillSpeed,
-                    pauseSec: activePreset.pauseSec,
-                  );
-                  LogService().addLog(
-                    '✨ Clean & Refill Started',
-                    'Preset: ${activePreset.name} | Drain ${activePreset.drainSec}s @ ${activePreset.drainSpeed}%, Settle ${activePreset.pauseSec}s, Refill ${activePreset.fillSec}s (~${activePreset.calculatedLiters.toStringAsFixed(2)}L) @ ${activePreset.fillSpeed}%',
-                    type: 'clean',
-                  );
-                  widget.onRefresh();
-                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 3),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+          const SizedBox(height: 1),
+          Text(
+            sub,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Color(0xFF64748B),
+              fontSize: 9.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStepMetric({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String value,
+    required String sub,
+  }) {
+    return Column(
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: iconColor, size: 14),
+            const SizedBox(width: 4),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Color(0xFF94A3B8),
+                fontSize: 10.5,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ],
-        ],
-      ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          value,
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 13,
+          ),
+        ),
+        Text(
+          sub,
+          style: const TextStyle(
+            color: Color(0xFF64748B),
+            fontSize: 9.5,
+          ),
+        ),
+      ],
     );
   }
 
@@ -2057,6 +3350,11 @@ class _PumpScreenState extends State<PumpScreen> {
                           pumpStatus: pump1,
                           onUpdatePump: (state, speed, dir) async {
                             final targetSpeed = speed < 10 ? 80 : speed;
+                            if (state) {
+                              _startManualDrainTracking();
+                            } else {
+                              _stopManualDrainTracking();
+                            }
                             await _apiService.setPumpState(
                                 widget.deviceUrl, state, targetSpeed,
                                 direction: dir);
@@ -2097,6 +3395,11 @@ class _PumpScreenState extends State<PumpScreen> {
                           pumpStatus: pump2,
                           onUpdatePump: (state, speed, dir) async {
                             final targetSpeed = speed < 10 ? 80 : speed;
+                            if (state) {
+                              _startManualRefillTracking();
+                            } else {
+                              _stopManualRefillTracking();
+                            }
                             await _apiService.setPump2State(
                                 widget.deviceUrl, state, targetSpeed,
                                 direction: dir);

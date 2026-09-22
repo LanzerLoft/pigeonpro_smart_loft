@@ -341,3 +341,25 @@ class HardwareScheduleData {
     );
   }
 }
+
+class WifiSaveResult {
+  final bool success;
+  final String? ip;
+  final String? ssid;
+  final String? error;
+
+  WifiSaveResult({
+    required this.success,
+    this.ip,
+    this.ssid,
+    this.error,
+  });
+
+  factory WifiSaveResult.success({String? ip, String? ssid}) {
+    return WifiSaveResult(success: true, ip: ip, ssid: ssid);
+  }
+
+  factory WifiSaveResult.failure(String error) {
+    return WifiSaveResult(success: false, error: error);
+  }
+}
