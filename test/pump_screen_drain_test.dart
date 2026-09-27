@@ -174,8 +174,21 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    // Draining stopped, draining banner is gone, refill is available
+    // Draining stopped, draining banner is gone, bowl has remaining water -> Drain & Refill is primary action
     expect(find.textContaining('DRAINING BOWL TO EMPTY'), findsNothing);
-    expect(find.textContaining('Refill'), findsOneWidget);
+    expect(find.textContaining('Refill'), findsWidgets);
+
+    // Tap Drain & Refill to open Refill Volume modal
+    final drainAndRefillBtn = find.textContaining('Drain & Refill');
+    expect(drainAndRefillBtn, findsWidgets);
+    await tester.ensureVisible(drainAndRefillBtn.first);
+    await tester.tap(drainAndRefillBtn.first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    // Verify modal elements are displayed
+    expect(find.text('SELECT REFILL VOLUME'), findsOneWidget);
+    expect(find.textContaining('Proceed with Drain & Refill'), findsOneWidget);
   });
 }
+

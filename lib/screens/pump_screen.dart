@@ -1337,6 +1337,591 @@ class _PumpScreenState extends State<PumpScreen>
     );
   }
 
+  Future<void> _showRefillVolumeModal(
+    BuildContext context, {
+    required bool isFlushAndRefill,
+  }) async {
+    bool modeFlush = isFlushAndRefill;
+    String selectedPresetId = _activePresetId;
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setModalState) {
+            final preset = _presets.firstWhere(
+              (p) => p.id == selectedPresetId,
+              orElse: () => _activePreset,
+            );
+
+            final smartDrainSec = _computeSmartDrainSec(preset: preset);
+            final currentOrAnimMl = _currentWaterLevelMl;
+            final missingMl =
+                (preset.volumeMl - currentOrAnimMl).clamp(0, preset.volumeMl);
+            final fillSecForRefill = missingMl > 0
+                ? math.max(3, ((missingMl / 1000.0) / _pumpLpm * 60.0).round())
+                : preset.fillSec;
+
+            return Container(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(sheetContext).size.height * 0.85,
+              ),
+              padding: EdgeInsets.only(
+                left: 20,
+                right: 20,
+                top: 14,
+                bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 20,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Drag Handle Bar
+                    Center(
+                      child: Container(
+                        width: 38,
+                        height: 4.5,
+                        margin: const EdgeInsets.only(bottom: 14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF475569),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+
+                    // Header Row: Title & Close Button
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: (modeFlush
+                                          ? const Color(0xFF38BDF8)
+                                          : const Color(0xFF10B981))
+                                      .withValues(alpha: 0.15),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  modeFlush
+                                      ? Icons.cleaning_services_rounded
+                                      : Icons.water_drop_rounded,
+                                  color: modeFlush
+                                      ? const Color(0xFF38BDF8)
+                                      : const Color(0xFF34D399),
+                                  size: 20,
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      modeFlush
+                                          ? 'Drain & Refill Drinker'
+                                          : 'Refill Drinker Bowl',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 16.5,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      modeFlush
+                                          ? '2-stage automated cycle: Drain old water ➔ pause ➔ refill fresh water.'
+                                          : (currentOrAnimMl <= 0
+                                              ? 'Direct fresh water fill into empty drinker bowl (skip drain).'
+                                              : 'Top-up fresh water into drinker bowl (skip drain).'),
+                                      style: const TextStyle(
+                                        color: Color(0xFF94A3B8),
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded,
+                              color: Color(0xFF94A3B8)),
+                          onPressed: () => Navigator.pop(sheetContext),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    // Mode Switcher Pill Tabs
+                    Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F172A),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFF334155)),
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: InkWell(
+                              onTap: () {
+                                setModalState(() {
+                                  modeFlush = false;
+                                });
+                              },
+                              borderRadius: BorderRadius.circular(9),
+                              child: Container(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: !modeFlush
+                                      ? const Color(0xFF10B981)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(9),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.water_drop_rounded,
+                                      size: 14,
+                                      color: !modeFlush
+                                          ? const Color(0xFF0F172A)
+                                          : const Color(0xFF94A3B8),
+                                    ),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      'Refill Only',
+                                      style: TextStyle(
+                                        color: !modeFlush
+                                            ? const Color(0xFF0F172A)
+                                            : const Color(0xFF94A3B8),
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 11.5,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: InkWell(
+                              onTap: () {
+                                setModalState(() {
+                                  modeFlush = true;
+                                });
+                              },
+                              borderRadius: BorderRadius.circular(9),
+                              child: Container(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: modeFlush
+                                      ? const Color(0xFF38BDF8)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(9),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.cleaning_services_rounded,
+                                      size: 14,
+                                      color: modeFlush
+                                          ? const Color(0xFF0F172A)
+                                          : const Color(0xFF94A3B8),
+                                    ),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      'Drain & Refill',
+                                      style: TextStyle(
+                                        color: modeFlush
+                                            ? const Color(0xFF0F172A)
+                                            : const Color(0xFF94A3B8),
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 11.5,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // Preset Section Header with Custom & Manage
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(Icons.bookmarks_rounded,
+                                color: Color(0xFF38BDF8), size: 15),
+                            SizedBox(width: 6),
+                            Text(
+                              'SELECT REFILL VOLUME',
+                              style: TextStyle(
+                                color: Color(0xFF38BDF8),
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                        Row(
+                          children: [
+                            OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFF34D399),
+                                side: const BorderSide(
+                                    color: Color(0xFF10B981), width: 1),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 4),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(8)),
+                              ),
+                              icon: const Icon(Icons.add_rounded, size: 13),
+                              label: const Text('Custom',
+                                  style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 10)),
+                              onPressed: () {
+                                _showAddEditPresetModal(
+                                  context,
+                                  onSaved: () {
+                                    setModalState(() {
+                                      selectedPresetId = _presets.last.id;
+                                    });
+                                    setState(() {
+                                      _activePresetId = _presets.last.id;
+                                    });
+                                  },
+                                );
+                              },
+                            ),
+                            const SizedBox(width: 6),
+                            OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFF38BDF8),
+                                side: const BorderSide(
+                                    color: Color(0xFF38BDF8), width: 1),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 4),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(8)),
+                              ),
+                              icon: const Icon(Icons.tune_rounded, size: 13),
+                              label: const Text('Manage',
+                                  style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 10)),
+                              onPressed: () async {
+                                await _showPresetManagerModal(context);
+                                setModalState(() {});
+                                setState(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 10),
+
+                    // Horizontal Preset Choice Chips
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          ..._presets.map((p) {
+                            final isSel = p.id == selectedPresetId;
+                            return Padding(
+                              padding: const EdgeInsets.only(right: 6),
+                              child: ChoiceChip(
+                                avatar: isSel
+                                    ? const Icon(
+                                        Icons.check_circle_rounded,
+                                        color: Color(0xFF0F172A),
+                                        size: 15,
+                                      )
+                                    : null,
+                                label: Text(
+                                  '${p.volumeChipLabel} (${p.name})',
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                selected: isSel,
+                                selectedColor: modeFlush
+                                    ? const Color(0xFF38BDF8)
+                                    : const Color(0xFF10B981),
+                                backgroundColor: const Color(0xFF0F172A),
+                                labelStyle: TextStyle(
+                                  color: isSel
+                                      ? const Color(0xFF0F172A)
+                                      : Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 11,
+                                ),
+                                side: BorderSide(
+                                  color: isSel
+                                      ? (modeFlush
+                                          ? const Color(0xFF38BDF8)
+                                          : const Color(0xFF10B981))
+                                      : const Color(0xFF334155),
+                                  width: isSel ? 1.5 : 1.0,
+                                ),
+                                onSelected: (_) async {
+                                  setModalState(() {
+                                    selectedPresetId = p.id;
+                                  });
+                                  setState(() {
+                                    _activePresetId = p.id;
+                                  });
+                                  await _savePresetsAndSyncActive();
+                                },
+                              ),
+                            );
+                          }),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    // Sequence & Timing Specs Card
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F172A),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: (modeFlush
+                                  ? const Color(0xFF38BDF8)
+                                  : const Color(0xFF10B981))
+                              .withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          if (modeFlush) ...[
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceAround,
+                              children: [
+                                _buildStepMetric(
+                                  icon: Icons.cleaning_services_rounded,
+                                  iconColor: const Color(0xFFEF4444),
+                                  title: 'Stage 1: Drain',
+                                  value: '${smartDrainSec}s',
+                                  sub: currentOrAnimMl <= 0
+                                      ? 'Dry (Skip)'
+                                      : 'Smart (${currentOrAnimMl}mL)',
+                                ),
+                                Container(
+                                  width: 1,
+                                  height: 32,
+                                  color: const Color(0xFF334155),
+                                ),
+                                _buildStepMetric(
+                                  icon: Icons.hourglass_top_rounded,
+                                  iconColor: const Color(0xFFF59E0B),
+                                  title: 'Pause Delay',
+                                  value: '${preset.pauseSec}s',
+                                  sub: 'Settle residual',
+                                ),
+                                Container(
+                                  width: 1,
+                                  height: 32,
+                                  color: const Color(0xFF334155),
+                                ),
+                                _buildStepMetric(
+                                  icon: Icons.water_drop_rounded,
+                                  iconColor: const Color(0xFF10B981),
+                                  title: 'Stage 2: Refill',
+                                  value: '${preset.fillSec}s',
+                                  sub:
+                                      '~${preset.calculatedLiters.toStringAsFixed(2)} L',
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E293B),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.info_outline_rounded,
+                                      size: 14, color: Color(0xFF38BDF8)),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      currentOrAnimMl <= 0
+                                          ? 'Bowl is dry. Drain phase will be skipped, refilling fresh water directly.'
+                                          : 'Evacuates $currentOrAnimMl mL in bowl in ${smartDrainSec}s @ ${preset.drainSpeed}% speed before fresh refill.',
+                                      style: const TextStyle(
+                                          fontSize: 10.5,
+                                          color: Color(0xFF94A3B8)),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ] else ...[
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceAround,
+                              children: [
+                                _buildStepMetric(
+                                  icon: Icons.water_damage_outlined,
+                                  iconColor: const Color(0xFF38BDF8),
+                                  title: 'Current Bowl',
+                                  value: '$currentOrAnimMl mL',
+                                  sub: currentOrAnimMl <= 0
+                                      ? 'Bowl Dry'
+                                      : 'In Drinker',
+                                ),
+                                Container(
+                                  width: 1,
+                                  height: 32,
+                                  color: const Color(0xFF334155),
+                                ),
+                                _buildStepMetric(
+                                  icon: Icons.water_drop_rounded,
+                                  iconColor: const Color(0xFF10B981),
+                                  title: 'Water to Add',
+                                  value: currentOrAnimMl <= 0
+                                      ? '${preset.volumeMl} mL'
+                                      : '+${preset.volumeMl > currentOrAnimMl ? preset.volumeMl - currentOrAnimMl : preset.volumeMl} mL',
+                                  sub: '${fillSecForRefill}s fill duration',
+                                ),
+                                Container(
+                                  width: 1,
+                                  height: 32,
+                                  color: const Color(0xFF334155),
+                                ),
+                                _buildStepMetric(
+                                  icon: Icons.check_circle_outline_rounded,
+                                  iconColor: const Color(0xFF34D399),
+                                  title: 'Target Volume',
+                                  value: preset.volumeChipLabel,
+                                  sub: '${preset.volumeMl} mL target',
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E293B),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: const Row(
+                                children: [
+                                  Icon(Icons.bolt_rounded,
+                                      size: 14, color: Color(0xFF10B981)),
+                                  SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      'Drain phase is skipped. Pump directly adds fresh water into the drinker bowl.',
+                                      style: TextStyle(
+                                          fontSize: 10.5,
+                                          color: Color(0xFF94A3B8)),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 18),
+
+                    // Proceed Action Button
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: modeFlush
+                              ? const Color(0xFF0284C7)
+                              : const Color(0xFF10B981),
+                          foregroundColor: modeFlush
+                              ? Colors.white
+                              : const Color(0xFF0F172A),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          elevation: 4,
+                          shadowColor: (modeFlush
+                                  ? const Color(0xFF0284C7)
+                                  : const Color(0xFF10B981))
+                              .withValues(alpha: 0.4),
+                        ),
+                        icon: Icon(
+                          modeFlush
+                              ? Icons.cleaning_services_rounded
+                              : Icons.water_drop_rounded,
+                          size: 20,
+                        ),
+                        label: Text(
+                          modeFlush
+                              ? 'Proceed with Drain & Refill (${preset.volumeChipLabel})'
+                              : 'Proceed with Refill (${preset.volumeChipLabel} • ${preset.volumeMl} mL)',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w900,
+                            fontSize: 14,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                        onPressed: () {
+                          Navigator.pop(sheetContext);
+                          if (modeFlush) {
+                            _triggerSequence(preset);
+                          } else {
+                            _triggerRefillOnly(preset);
+                          }
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   Future<void> _showAddEditPresetModal(
     BuildContext context, {
     DrinkerPreset? presetToEdit,
@@ -2341,35 +2926,43 @@ class _PumpScreenState extends State<PumpScreen>
 
           const SizedBox(height: 16),
 
-          // Controls & Action Area
           if (isDeviceCycleActive) ...[
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                      const Color(0xFFEF4444).withValues(alpha: 0.2),
-                  foregroundColor: const Color(0xFFFCA5A5),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  padding: const EdgeInsets.symmetric(vertical: 13),
+            Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: phaseColor.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: phaseColor.withValues(alpha: 0.4),
                 ),
-                icon: const Icon(Icons.stop_circle, size: 20),
-                label: const Text('Cancel Active Flush & Refill Sequence',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                onPressed: () async {
-                  await _apiService.stopDrinkerAutoCycle(widget.deviceUrl);
-                  setState(() {
-                    _wasCycleActive = false;
-                    _isCycleCompleted = false;
-                  });
-                  LogService().addLog(
-                    '🛑 Clean & Refill Cancelled',
-                    'Sequence manually stopped by user.',
-                    type: 'clean',
-                  );
-                  widget.onRefresh();
-                },
+              ),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.2,
+                      color: phaseColor,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      phase == 1
+                          ? 'Stage 1: Draining Drinker Bowl... (${remainingSec}s left)'
+                          : (phase == 2
+                              ? 'Residual Water Settling... (${remainingSec}s left)'
+                              : 'Stage 2: Refilling Fresh Water... (${remainingSec}s left)'),
+                      style: TextStyle(
+                        color: phaseColor,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -2820,7 +3413,8 @@ class _PumpScreenState extends State<PumpScreen>
                                     (_lastRefill?.volumeMl ??
                                         activePreset.volumeMl))
                             ? null
-                            : () => _triggerRefillOnly(activePreset),
+                            : () => _showRefillVolumeModal(context,
+                                isFlushAndRefill: false),
                       ),
 
                     ],
@@ -2828,188 +3422,127 @@ class _PumpScreenState extends State<PumpScreen>
                 ],
               ),
             ),
-            // Default View: Redesigned Volume Preset Selector & Sequence Specs
+            // Streamlined Active Preset Badge & Quick Volume Bar
             Container(
-              padding: const EdgeInsets.all(14),
+              margin: const EdgeInsets.only(bottom: 14),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
                 color: const Color(0xFF0F172A),
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(14),
                 border: Border.all(
-                    color: const Color(0xFF38BDF8).withValues(alpha: 0.2)),
+                  color: const Color(0xFF38BDF8).withValues(alpha: 0.25),
+                ),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Row(
                 children: [
-                  // Row: Title & Manage Presets
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(Icons.bookmarks_rounded,
-                              color: Color(0xFF38BDF8), size: 16),
-                          SizedBox(width: 6),
-                          Text(
-                            'SELECT REFILL VOLUME',
-                            style: TextStyle(
-                              color: Color(0xFF38BDF8),
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.6,
-                            ),
-                          ),
-                        ],
-                      ),
-                      OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFF38BDF8),
-                          side: const BorderSide(
-                              color: Color(0xFF38BDF8), width: 1),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          minimumSize: Size.zero,
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8)),
-                        ),
-                        icon: const Icon(Icons.tune_rounded, size: 13),
-                        label: const Text('Manage All',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold, fontSize: 10)),
-                        onPressed: () => _showPresetManagerModal(context),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-
-                  // Horizontal Preset Choice Chips
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: [
-                        ..._presets.map((preset) {
-                          final isSel = preset.id == _activePresetId;
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 6),
-                            child: ChoiceChip(
-                              avatar: isSel
-                                  ? const Icon(Icons.check_circle_rounded,
-                                      color: Color(0xFF0F172A), size: 15)
-                                  : null,
-                              label: Text(
-                                '${preset.volumeChipLabel} (${preset.name})',
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              selected: isSel,
-                              selectedColor: const Color(0xFF38BDF8),
-                              backgroundColor: const Color(0xFF1E293B),
-                              labelStyle: TextStyle(
-                                color: isSel
-                                    ? const Color(0xFF0F172A)
-                                    : Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 11,
-                              ),
-                              side: BorderSide(
-                                color: isSel
-                                    ? const Color(0xFF38BDF8)
-                                    : const Color(0xFF334155),
-                                width: isSel ? 1.5 : 1.0,
-                              ),
-                              onSelected: (_) async {
-                                setState(() {
-                                  _activePresetId = preset.id;
-                                });
-                                await _savePresetsAndSyncActive();
-                              },
-                            ),
-                          );
-                        }),
-                        ActionChip(
-                          avatar: const Icon(Icons.add_circle_outline_rounded,
-                              color: Color(0xFF10B981), size: 15),
-                          label: const Text('+ Custom Volume'),
-                          backgroundColor:
-                              const Color(0xFF10B981).withValues(alpha: 0.15),
-                          labelStyle: const TextStyle(
-                            color: Color(0xFF34D399),
-                            fontWeight: FontWeight.bold,
-                            fontSize: 11,
-                          ),
-                          side: const BorderSide(
-                              color: Color(0xFF34D399), width: 1),
-                          onPressed: () {
-                            _showAddEditPresetModal(
-                              context,
-                              onSaved: () => setState(() {}),
-                            );
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  const SizedBox(height: 12),
-
-                  // 3-Step Sequence Specs Bar (Drain ➔ Settle ➔ Refill)
                   Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 10),
+                    padding: const EdgeInsets.all(6),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF1E293B),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: const Color(0xFF334155)),
+                      color: const Color(0xFF38BDF8).withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
                     ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    child: const Icon(
+                      Icons.bookmarks_rounded,
+                      color: Color(0xFF38BDF8),
+                      size: 15,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // Drain Step (Smart computed from remaining water in bowl)
-                        _buildStepMetric(
-                          icon: Icons.cleaning_services_rounded,
-                          iconColor: const Color(0xFFEF4444),
-                          title: 'Stage 1: Drain',
-                          value: '${smartDrainSec}s',
-                          sub: currentOrAnimMl <= 0
-                              ? 'Dry (Skip)'
-                              : 'Smart (${currentOrAnimMl}mL)',
+                        const Text(
+                          'ACTIVE REFILL PRESET',
+                          style: TextStyle(
+                            color: Color(0xFF38BDF8),
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.5,
+                          ),
                         ),
-                        Container(
-                          width: 1,
-                          height: 30,
-                          color: const Color(0xFF334155),
-                        ),
-                        // Settle Step
-                        _buildStepMetric(
-                          icon: Icons.hourglass_top_rounded,
-                          iconColor: const Color(0xFFF59E0B),
-                          title: 'Pause Delay',
-                          value: '${activePreset.pauseSec}s',
-                          sub: 'Settle residual',
-                        ),
-                        Container(
-                          width: 1,
-                          height: 30,
-                          color: const Color(0xFF334155),
-                        ),
-                        // Refill Step
-                        _buildStepMetric(
-                          icon: Icons.water_drop_rounded,
-                          iconColor: const Color(0xFF10B981),
-                          title: 'Stage 2: Refill',
-                          value: '${activePreset.fillSec}s',
-                          sub:
-                              '~${activePreset.calculatedLiters.toStringAsFixed(2)} L',
+                        const SizedBox(height: 1),
+                        Text(
+                          '${activePreset.volumeChipLabel} • ${activePreset.name} (${activePreset.volumeMl} mL)',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ],
                     ),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF38BDF8),
+                      side: BorderSide(
+                        color: const Color(0xFF38BDF8).withValues(alpha: 0.6),
+                        width: 1,
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    icon: const Icon(Icons.tune_rounded, size: 13),
+                    label: const Text(
+                      'Change',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 10.5,
+                      ),
+                    ),
+                    onPressed: () => _showRefillVolumeModal(context,
+                        isFlushAndRefill: false),
                   ),
                 ],
               ),
             ),
 
-            const SizedBox(height: 14),
-
-            if (_isDrainingToEmpty) ...[
+            if (isDeviceCycleActive) ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFDC2626),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    elevation: 4,
+                    shadowColor: const Color(0xFFDC2626).withValues(alpha: 0.4),
+                  ),
+                  icon: const Icon(Icons.stop_circle_rounded, size: 22),
+                  label: Text(
+                    'Cancel Active Sequence (${remainingSec}s left)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 13.5,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  onPressed: () async {
+                    await _apiService.stopDrinkerAutoCycle(widget.deviceUrl);
+                    setState(() {
+                      _wasCycleActive = false;
+                      _isCycleCompleted = false;
+                    });
+                    LogService().addLog(
+                      '🛑 Clean & Refill Cancelled',
+                      'Sequence manually stopped by user.',
+                      type: 'clean',
+                    );
+                    widget.onRefresh();
+                  },
+                ),
+              ),
+            ] else if (_isDrainingToEmpty) ...[
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
@@ -3035,6 +3568,7 @@ class _PumpScreenState extends State<PumpScreen>
                 ),
               ),
             ] else if (currentOrAnimMl <= 0) ...[
+              // Bowl is dry (0 mL) -> Primary action is Start Refill fresh water
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
@@ -3056,34 +3590,8 @@ class _PumpScreenState extends State<PumpScreen>
                       letterSpacing: 0.3,
                     ),
                   ),
-                  onPressed: () => _triggerRefillOnly(activePreset),
-                ),
-              ),
-            ] else ...[
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF10B981),
-                    foregroundColor: const Color(0xFF0F172A),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    elevation: 4,
-                    shadowColor: const Color(0xFF10B981).withValues(alpha: 0.4),
-                  ),
-                  icon: const Icon(Icons.water_drop_rounded, size: 22),
-                  label: Text(
-                    activePreset.volumeMl > currentOrAnimMl
-                        ? 'Refill Drinker Bowl (+${activePreset.volumeMl - currentOrAnimMl} mL • Skip Drain)'
-                        : 'Top-Up Drinker Bowl (${activePreset.volumeChipLabel} • Skip Drain)',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w900,
-                      fontSize: 13.5,
-                      letterSpacing: 0.3,
-                    ),
-                  ),
-                  onPressed: () => _triggerRefillOnly(activePreset),
+                  onPressed: () => _showRefillVolumeModal(context,
+                      isFlushAndRefill: false),
                 ),
               ),
               const SizedBox(height: 10),
@@ -3092,22 +3600,81 @@ class _PumpScreenState extends State<PumpScreen>
                 child: OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
                     foregroundColor: const Color(0xFF38BDF8),
-                    side: const BorderSide(color: Color(0xFF0284C7), width: 1.3),
-                    backgroundColor: const Color(0xFF0284C7).withValues(alpha: 0.08),
+                    side: const BorderSide(
+                        color: Color(0xFF0284C7), width: 1.3),
+                    backgroundColor:
+                        const Color(0xFF0284C7).withValues(alpha: 0.08),
                     shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14)),
                     padding: const EdgeInsets.symmetric(vertical: 12),
                   ),
                   icon: const Icon(Icons.cleaning_services_rounded, size: 18),
+                  label: const Text(
+                    'Drain & Refill Drinker',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12.5,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                  onPressed: () => _showRefillVolumeModal(context,
+                      isFlushAndRefill: true),
+                ),
+              ),
+            ] else ...[
+              // Bowl has water or is filled up (currentOrAnimMl > 0) -> Primary action MUST be Drain & Refill!
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0284C7),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    elevation: 4,
+                    shadowColor: const Color(0xFF0284C7).withValues(alpha: 0.4),
+                  ),
+                  icon: const Icon(Icons.cleaning_services_rounded, size: 20),
                   label: Text(
-                    'Full Flush (${smartDrainSec}s) & Refill (${activePreset.volumeChipLabel})',
+                    'Drain & Refill (${smartDrainSec}s ➔ ${activePreset.volumeChipLabel})',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 13.5,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                  onPressed: () => _showRefillVolumeModal(context,
+                      isFlushAndRefill: true),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF34D399),
+                    side: const BorderSide(
+                        color: Color(0xFF10B981), width: 1.2),
+                    backgroundColor:
+                        const Color(0xFF10B981).withValues(alpha: 0.08),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  icon: const Icon(Icons.water_drop_rounded, size: 18),
+                  label: Text(
+                    activePreset.volumeMl > currentOrAnimMl
+                        ? 'Top-Up Refill (+${activePreset.volumeMl - currentOrAnimMl} mL • Skip Drain)'
+                        : 'Top-Up Refill (${activePreset.volumeChipLabel} • Skip Drain)',
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       fontSize: 12.5,
                       letterSpacing: 0.2,
                     ),
                   ),
-                  onPressed: () => _triggerSequence(activePreset),
+                  onPressed: () => _showRefillVolumeModal(context,
+                      isFlushAndRefill: false),
                 ),
               ),
             ],
